@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from detectron2.config import configurable
-from detectron2.layers import ShapeSpec, nonzero_tuple
+from detectron2.layers import ShapeSpec, nonzero_tuple, cat, interpolate
 from detectron2.structures import Boxes, ImageList, Instances, pairwise_iou
 from detectron2.utils.events import get_event_storage
 from detectron2.utils.registry import Registry
@@ -20,7 +20,20 @@ from ..sampling import subsample_labels
 from .box_head import build_box_head
 from .fast_rcnn import FastRCNNOutputLayers
 from .keypoint_head import build_keypoint_head
-from .mask_head import build_mask_head
+from .mask_head import build_mask_head,mask_rcnn_inference,mask_rcnn_loss
+from .maskiou_head import build_maskiou_head,get_maskiou_head_inputs,mask_iou_inference,mask_iou_loss
+from .pointrend_head import (
+    build_pointrend_head,
+    roi_mask_point_loss,
+    generate_regular_grid_point_coords,
+    get_point_coords_wrt_image,
+    get_uncertain_point_coords_on_grid,
+    get_uncertain_point_coords_with_randomness,
+    point_sample,
+    point_sample_fine_grained_features,
+    sample_point_labels,
+    calculate_uncertainty
+)
 
 ROI_HEADS_REGISTRY = Registry("ROI_HEADS")
 ROI_HEADS_REGISTRY.__doc__ = """
@@ -550,10 +563,25 @@ class StandardROIHeads(ROIHeads):
         mask_in_features: Optional[List[str]] = None,
         mask_pooler: Optional[ROIPooler] = None,
         mask_head: Optional[nn.Module] = None,
+        maskiou_head: Optional[nn.Module] = None,
+        maskiou_loss_weight: Optional[float] = None,
+        maskiou_loss_type: str = "Smooth L1",
         keypoint_in_features: Optional[List[str]] = None,
         keypoint_pooler: Optional[ROIPooler] = None,
         keypoint_head: Optional[nn.Module] = None,
+        pointrend_head: Optional[nn.Module] = None,
+        pointrend_in_features: Optional[List[str]] = None,
         train_on_pred_boxes: bool = False,
+        mask_point_on: bool = False,
+        mask_point_in_features: Optional[List[str]] = None,
+        mask_point_train_num_points: Optional[int] = None,
+        mask_point_oversample_ratio: Optional[float] = None,
+        mask_point_importance_sample_ratio: Optional[float] = None,
+        mask_point_subdivision_init_resolution: Optional[int] = None,
+        mask_point_subdivision_steps: Optional[int] = None,
+        mask_point_subdivision_num_points: Optional[int] = None,
+        in_channels: Optional[int] = None,
+        _feature_scales: Optional[Dict[str,float]] = None,
         **kwargs,
     ):
         """
@@ -589,11 +617,32 @@ class StandardROIHeads(ROIHeads):
             self.mask_pooler = mask_pooler
             self.mask_head = mask_head
 
+        self.maskiou_on = self.mask_on and maskiou_head is not None
+        if self.maskiou_on:
+            self.maskiou_head = maskiou_head
+            self.maskiou_loss_weight = maskiou_loss_weight
+            self.maskiou_loss_type = maskiou_loss_type
+
         self.keypoint_on = keypoint_in_features is not None
         if self.keypoint_on:
             self.keypoint_in_features = keypoint_in_features
             self.keypoint_pooler = keypoint_pooler
             self.keypoint_head = keypoint_head
+        
+        self.pointrend_on = self.mask_on and pointrend_head is not None
+        if self.pointrend_on:
+            self.pointrend_head = pointrend_head
+            self.pointrend_in_features = pointrend_in_features
+            self.mask_point_on = mask_point_on
+            self.mask_point_in_features = mask_point_in_features
+            self.mask_point_train_num_points = mask_point_train_num_points
+            self.mask_point_oversample_ratio = mask_point_oversample_ratio
+            self.mask_point_importance_sample_ratio = mask_point_importance_sample_ratio
+            self.mask_point_subdivision_init_resolution = mask_point_subdivision_init_resolution
+            self.mask_point_subdivision_steps = mask_point_subdivision_steps
+            self.mask_point_subdivision_num_points = mask_point_subdivision_num_points
+            self.in_channels = in_channels
+            self._feature_scales = _feature_scales
 
         self.train_on_pred_boxes = train_on_pred_boxes
 
@@ -612,6 +661,10 @@ class StandardROIHeads(ROIHeads):
             ret.update(cls._init_mask_head(cfg, input_shape))
         if inspect.ismethod(cls._init_keypoint_head):
             ret.update(cls._init_keypoint_head(cfg, input_shape))
+        if inspect.ismethod(cls._init_maskiou_head):
+            ret.update(cls._init_maskiou_head(cfg, input_shape))
+        if inspect.ismethod(cls._init_pointrend_head):
+            ret.update(cls._init_pointrend_head(cfg, input_shape))
         return ret
 
     @classmethod
@@ -686,6 +739,64 @@ class StandardROIHeads(ROIHeads):
         return ret
 
     @classmethod
+    def _init_maskiou_head(cls, cfg, input_shape):
+        ret = {}
+
+        ret["maskiou_head"] = build_maskiou_head(
+            cfg,input_shape
+        ) if cfg.MODEL.MASKIOU_ON else None
+        ret["maskiou_loss_weight"] = cfg.MODEL.ROI_MASKIOU_HEAD.LOSS_WEIGHT
+        ret["maskiou_loss_type"] = cfg.MODEL.ROI_MASKIOU_HEAD.LOSS_TYPE
+        return ret
+    
+    @classmethod
+    def _init_pointrend_head(cls, cfg, input_shape):
+        # fmt: off
+
+        mask_point_on                      = cfg.MODEL.POINT_HEAD_ON
+        if not mask_point_on:
+            ret = {"mask_point_on" : False}
+            return ret
+        assert cfg.MODEL.ROI_HEADS.NUM_CLASSES == cfg.MODEL.POINT_HEAD.NUM_CLASSES
+        mask_point_in_features             = cfg.MODEL.POINT_HEAD.IN_FEATURES
+        mask_point_train_num_points        = cfg.MODEL.POINT_HEAD.TRAIN_NUM_POINTS
+        mask_point_oversample_ratio        = cfg.MODEL.POINT_HEAD.OVERSAMPLE_RATIO
+        mask_point_importance_sample_ratio = cfg.MODEL.POINT_HEAD.IMPORTANCE_SAMPLE_RATIO
+        # next three parameters are use in the adaptive subdivions inference procedure
+        mask_point_subdivision_init_resolution = 28
+        mask_point_subdivision_steps       = cfg.MODEL.POINT_HEAD.SUBDIVISION_STEPS
+        mask_point_subdivision_num_points  = cfg.MODEL.POINT_HEAD.SUBDIVISION_NUM_POINTS
+        _feature_scales = {k: 1.0 / v.stride for k, v in input_shape.items()}
+        # fmt: on
+
+        in_channels = int(np.sum([input_shape[f].channels for f in mask_point_in_features]))
+        point_head = build_pointrend_head(cfg, ShapeSpec(channels=in_channels, width=1, height=1))
+
+        # An optimization to skip unused subdivision steps: if after subdivision, all pixels on
+        # the mask will be selected and recomputed anyway, we should just double our init_resolution
+        while (
+            4 * mask_point_subdivision_init_resolution**2
+            <= mask_point_subdivision_num_points
+        ):
+            mask_point_subdivision_init_resolution *= 2
+            mask_point_subdivision_steps -= 1
+        
+        ret = {
+            "mask_point_on" : mask_point_on,
+            "mask_point_in_features" : mask_point_in_features,
+            "mask_point_train_num_points" : mask_point_train_num_points,
+            "mask_point_oversample_ratio" : mask_point_oversample_ratio,
+            "mask_point_importance_sample_ratio" : mask_point_importance_sample_ratio,
+            "mask_point_subdivision_init_resolution" : mask_point_subdivision_init_resolution,
+            "mask_point_subdivision_steps" : mask_point_subdivision_steps,
+            "mask_point_subdivision_num_points" : mask_point_subdivision_num_points,
+            "in_channels" : in_channels,
+            "pointrend_head" : point_head,
+            "_feature_scales" : _feature_scales,
+        }
+        return ret
+
+    @classmethod
     def _init_keypoint_head(cls, cfg, input_shape):
         if not cfg.MODEL.KEYPOINT_ON:
             return {}
@@ -742,6 +853,8 @@ class StandardROIHeads(ROIHeads):
             # predicted by the box head.
             losses.update(self._forward_mask(features, proposals))
             losses.update(self._forward_keypoint(features, proposals))
+            losses.update(self._forward_maskiou(features, proposals))
+            losses.update(self._forward_point_head(features, proposals))
             return proposals, losses
         else:
             pred_instances = self._forward_box(features, proposals)
@@ -775,6 +888,8 @@ class StandardROIHeads(ROIHeads):
 
         instances = self._forward_mask(features, instances)
         instances = self._forward_keypoint(features, instances)
+        instances = self._forward_maskiou(features, instances)
+        instances = self._forward_point_head(features, instances)
         return instances
 
     def _forward_box(self, features: Dict[str, torch.Tensor], proposals: List[Instances]):
@@ -837,13 +952,34 @@ class StandardROIHeads(ROIHeads):
             # head is only trained on positive proposals.
             instances, _ = select_foreground_proposals(instances, self.num_classes)
 
+        orig_features = features
         if self.mask_pooler is not None:
             features = [features[f] for f in self.mask_in_features]
             boxes = [x.proposal_boxes if self.training else x.pred_boxes for x in instances]
             features = self.mask_pooler(features, boxes)
+            orig_features["mask_pooler_out"] = features
         else:
             features = {f: features[f] for f in self.mask_in_features}
-        return self.mask_head(features, instances)
+        result = self.mask_head(features, instances)
+        orig_features["mask_logits"] = self.mask_head.x
+        return result
+    
+    def _forward_maskiou(self, features: Dict[str, torch.Tensor], instances: List[Instances]):
+        if not self.maskiou_on:
+            return {} if self.training else instances
+        
+        if self.training:
+            instances, _ = select_foreground_proposals(instances, self.num_classes)
+            #print(instances)
+            selected_mask,labels,maskiou_targets = get_maskiou_head_inputs(features["mask_logits"], instances)
+            #print(maskiou_targets)
+            pred_maskiou = self.maskiou_head(features["mask_pooler_out"], selected_mask)
+            loss = mask_iou_loss(labels, pred_maskiou, maskiou_targets, self.maskiou_loss_weight, self.maskiou_loss_type)
+            return {"loss_maskiou": loss}
+        else:
+            pred_maskiou = self.maskiou_head(features["mask_pooler_out"], torch.cat([i.pred_masks for i in instances], 0))
+            mask_iou_inference(instances, pred_maskiou)
+            return instances
 
     def _forward_keypoint(self, features: Dict[str, torch.Tensor], instances: List[Instances]):
         """
@@ -875,3 +1011,209 @@ class StandardROIHeads(ROIHeads):
         else:
             features = {f: features[f] for f in self.keypoint_in_features}
         return self.keypoint_head(features, instances)
+
+    def _forward_point_head(self, features: Dict[str, torch.Tensor], instances: List[Instances]):
+        if not self.pointrend_on:
+            return {} if self.training else instances
+
+        if self.training:
+            # head is only trained on positive proposals.
+            instances, _ = select_foreground_proposals(instances, self.num_classes)
+
+            losses = {}
+            proposal_boxes = [x.proposal_boxes for x in instances]
+            coarse_mask = features["mask_logits"]
+
+            point_coords, point_labels = self._sample_train_points(coarse_mask, instances)
+            point_fine_grained_features = self._point_pooler(features, proposal_boxes, point_coords)
+            point_logits = self._get_point_logits(
+                point_fine_grained_features, point_coords, coarse_mask
+            )
+            losses["loss_mask_point"] = roi_mask_point_loss(point_logits, instances, point_labels)
+            return losses
+        else:
+            coarse_mask = features["mask_logits"]
+            return self._subdivision_inference(features, coarse_mask, instances)
+    
+    def _roi_pooler(self, features: List[torch.Tensor], boxes: List[Boxes]):
+        """
+        Extract per-box feature. This is similar to RoIAlign(sampling_ratio=1) except:
+        1. It's implemented by point_sample
+        2. It pools features across all levels and concat them, while typically
+           RoIAlign select one level for every box. However in the config we only use
+           one level (p2) so there is no difference.
+
+        Returns:
+            Tensor of shape (R, C, pooler_size, pooler_size) where R is the total number of boxes
+        """
+        features_list = [features[k] for k in self.roi_pooler_in_features]
+        features_scales = [self._feature_scales[k] for k in self.roi_pooler_in_features]
+
+        num_boxes = sum(x.tensor.size(0) for x in boxes)
+        output_size = self.roi_pooler_size
+        point_coords = generate_regular_grid_point_coords(num_boxes, output_size, boxes[0].device)
+        # For regular grids of points, this function is equivalent to `len(features_list)' calls
+        # of `ROIAlign` (with `SAMPLING_RATIO=1`), and concat the results.
+        roi_features, _ = point_sample_fine_grained_features(
+            features_list, features_scales, boxes, point_coords
+        )
+        return roi_features.view(num_boxes, roi_features.shape[1], output_size, output_size)
+
+    def _sample_train_points(self, coarse_mask, instances):
+        assert self.training
+        gt_classes = cat([x.gt_classes for x in instances])
+        with torch.no_grad():
+            # sample point_coords
+            point_coords = get_uncertain_point_coords_with_randomness(
+                coarse_mask,
+                lambda logits: calculate_uncertainty(logits, gt_classes),
+                self.mask_point_train_num_points,
+                self.mask_point_oversample_ratio,
+                self.mask_point_importance_sample_ratio,
+            )
+            # sample point_labels
+            proposal_boxes = [x.proposal_boxes for x in instances]
+            cat_boxes = Boxes.cat(proposal_boxes)
+            point_coords_wrt_image = get_point_coords_wrt_image(cat_boxes.tensor, point_coords)
+            point_labels = sample_point_labels(instances, point_coords_wrt_image)
+        return point_coords, point_labels
+
+    def _point_pooler(self, features, proposal_boxes, point_coords):
+        point_features_list = [features[k] for k in self.mask_point_in_features]
+        point_features_scales = [self._feature_scales[k] for k in self.mask_point_in_features]
+        # sample image-level features
+        point_fine_grained_features, _ = point_sample_fine_grained_features(
+            point_features_list, point_features_scales, proposal_boxes, point_coords
+        )
+        return point_fine_grained_features
+
+    def _get_point_logits(self, point_fine_grained_features, point_coords, coarse_mask):
+        coarse_features = point_sample(coarse_mask, point_coords, align_corners=False)
+        point_logits = self.pointrend_head(point_fine_grained_features, coarse_features)
+        return point_logits
+
+    def _subdivision_inference(self, features, mask_representations, instances):
+        assert not self.training
+
+        pred_boxes = [x.pred_boxes for x in instances]
+        pred_classes = cat([x.pred_classes for x in instances])
+
+        mask_logits = None
+        # +1 here to include an initial step to generate the coarsest mask
+        # prediction with init_resolution, when mask_logits is None.
+        # We compute initial mask by sampling on a regular grid. coarse_mask
+        # can be used as initial mask as well, but it's typically very low-res
+        # so it will be completely overwritten during subdivision anyway.
+        for _ in range(self.mask_point_subdivision_steps + 1):
+            if mask_logits is None:
+                point_coords = generate_regular_grid_point_coords(
+                    pred_classes.size(0),
+                    self.mask_point_subdivision_init_resolution,
+                    pred_boxes[0].device,
+                )
+            else:
+                mask_logits = interpolate(
+                    mask_logits, scale_factor=2, mode="bilinear", align_corners=False
+                )
+                uncertainty_map = calculate_uncertainty(mask_logits, pred_classes)
+                point_indices, point_coords = get_uncertain_point_coords_on_grid(
+                    uncertainty_map, self.mask_point_subdivision_num_points
+                )
+
+            # Run the point head for every point in point_coords
+            fine_grained_features = self._point_pooler(features, pred_boxes, point_coords)
+            point_logits = self._get_point_logits(
+                fine_grained_features, point_coords, mask_representations
+            )
+
+            if mask_logits is None:
+                # Create initial mask_logits using point_logits on this regular grid
+                R, C, _ = point_logits.shape
+                mask_logits = point_logits.reshape(
+                    R,
+                    C,
+                    self.mask_point_subdivision_init_resolution,
+                    self.mask_point_subdivision_init_resolution,
+                )
+                # The subdivision code will fail with the empty list of boxes
+                if len(pred_classes) == 0:
+                    mask_rcnn_inference(mask_logits, instances)
+                    return instances
+            else:
+                # Put point predictions to the right places on the upsampled grid.
+                R, C, H, W = mask_logits.shape
+                point_indices = point_indices.unsqueeze(1).expand(-1, C, -1)
+                mask_logits = (
+                    mask_logits.reshape(R, C, H * W)
+                    .scatter_(2, point_indices, point_logits)
+                    .view(R, C, H, W)
+                )
+        mask_rcnn_inference(mask_logits, instances)
+        return instances
+
+
+@ROI_HEADS_REGISTRY.register()
+class BoundaryROIHeads(StandardROIHeads):
+    @configurable
+    def __init__(
+        self,
+        *,
+        boundary_pooler : Optional[ROIPooler]=None,
+        boundary_in_features : Optional[List[str]]=None,
+        **kwargs,
+    ):
+        """
+        Same as StandardROIHeads but with extra processing for boundary preserving head
+        """
+        super().__init__(**kwargs)
+        if self.mask_on:
+            self.boundary_pooler = boundary_pooler
+            self.boundary_in_features = boundary_in_features
+
+    @classmethod
+    def _init_mask_head(cls, cfg, input_shape):
+        ret = super()._init_mask_head(cfg, input_shape)
+        # fmt: off
+        sampling_ratio    = cfg.MODEL.ROI_MASK_HEAD.POOLER_SAMPLING_RATIO
+        pooler_type       = cfg.MODEL.ROI_MASK_HEAD.POOLER_TYPE
+        # edge poolers
+        boundary_resolution     = cfg.MODEL.BOUNDARY_MASK_HEAD.POOLER_RESOLUTION
+        boundary_in_features    = cfg.MODEL.BOUNDARY_MASK_HEAD.IN_FEATURES
+        boundary_scales         = tuple(1.0 / input_shape[k].stride for k in boundary_in_features)
+        # fmt: on
+
+        ret["boundary_pooler"] = ROIPooler(
+            output_size=boundary_resolution,
+            scales=boundary_scales,
+            sampling_ratio=sampling_ratio,
+            pooler_type=pooler_type
+        )
+        ret["boundary_in_features"] = boundary_in_features
+        return ret
+
+    def _forward_mask(self, features: Dict[str, torch.Tensor], instances: List[Instances]):
+        if not self.mask_on:
+            return {} if self.training else instances
+
+        if self.training:
+            # head is only trained on positive proposals.
+            instances, _ = select_foreground_proposals(instances, self.num_classes)
+
+        if self.mask_pooler is not None:
+            mask_features = [features[f] for f in self.mask_in_features]
+            boxes = [x.proposal_boxes if self.training else x.pred_boxes for x in instances]
+            mask_features = self.mask_pooler(mask_features, boxes)
+            features["mask_pooler_out"] = mask_features
+        else:
+            mask_features = {f: mask_features[f] for f in self.mask_in_features}
+
+        if self.boundary_pooler is not None:
+            boundary_features = [features[f] for f in self.boundary_in_features]
+            boxes = [x.proposal_boxes if self.training else x.pred_boxes for x in instances]
+            boundary_features = self.boundary_pooler(boundary_features, boxes)
+        else:
+            boundary_features = {f: features[f] for f in self.boundary_in_features}
+        result = self.mask_head(mask_features, boundary_features, instances)
+        features["mask_logits"] = self.mask_head.x
+
+        return result

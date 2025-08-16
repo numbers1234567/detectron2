@@ -32,6 +32,7 @@ from detectron2.data import (
     MetadataCatalog,
     build_detection_test_loader,
     build_detection_train_loader,
+    DatasetMapper,
 )
 from detectron2.engine import default_argument_parser, default_setup, default_writers, launch
 from detectron2.evaluation import (
@@ -49,9 +50,11 @@ from detectron2.evaluation import (
 from detectron2.modeling import build_model
 from detectron2.solver import build_lr_scheduler, build_optimizer
 from detectron2.utils.events import EventStorage
+from detectron2.data import transforms as T
+import numpy as np
+import cv2
 
 logger = logging.getLogger("detectron2")
-
 
 def get_evaluator(cfg, dataset_name, output_folder=None):
     """
@@ -128,16 +131,70 @@ def do_train(cfg, model, resume=False):
     )
 
     writers = default_writers(cfg.OUTPUT_DIR, max_iter) if comm.is_main_process() else []
+    # Taken from detection_utils.py augmentations
+    is_train=True
+    if is_train:
+        min_size = cfg.INPUT.MIN_SIZE_TRAIN
+        max_size = cfg.INPUT.MAX_SIZE_TRAIN
+        sample_style = cfg.INPUT.MIN_SIZE_TRAIN_SAMPLING
+    else:
+        min_size = cfg.INPUT.MIN_SIZE_TEST
+        max_size = cfg.INPUT.MAX_SIZE_TEST
+        sample_style = "choice"
+    augmentation = [T.ResizeShortestEdge(min_size, max_size, sample_style)]
+    if is_train and cfg.INPUT.RANDOM_FLIP != "none":
+        augmentation.append(
+            T.RandomFlip(
+                horizontal=cfg.INPUT.RANDOM_FLIP == "horizontal",
+                vertical=cfg.INPUT.RANDOM_FLIP == "vertical",
+            )
+        )
+
+    augmentation += [
+        T.RandomBrightness(0.7, 1.3),
+        T.RandomContrast(0.7, 1.3),
+        T.RandomSaturation(0.7, 1.3),
+        T.RandomApply(
+            T.RandomRotation([-15,15], expand=False),
+        ),
+        T.RandomApply(
+            T.RandomCrop("relative_range", (0.7,0.95)),
+        ),
+    ]
 
     # compared to "train_net.py", we do not support accurate timing and
     # precise BN here, because they are not trivial to implement in a small training loop
-    data_loader = build_detection_train_loader(cfg)
+    kwargs = DatasetMapper.from_config(cfg)
+    del kwargs["augmentations"]
+    del kwargs["recompute_boxes"]
+    data_loader = build_detection_train_loader(
+        cfg,
+        mapper=DatasetMapper(
+            augmentations=augmentation,
+            recompute_boxes=True,
+            **kwargs,
+        ),
+    )
     logger.info("Starting training from iteration {}".format(start_iter))
     with EventStorage(start_iter) as storage:
         for data, iteration in zip(data_loader, range(start_iter, max_iter)):
             storage.iter = iteration
 
             loss_dict = model(data)
+            
+            image = data[0]["image"].cpu().detach().numpy()
+            boxes = data[0]["instances"].gt_boxes.tensor.cpu().detach().numpy().astype(np.int32)
+            image = np.transpose(image, (1, 2, 0)).astype(np.uint8)
+            image = image.copy()
+            height,width = image.shape[:2]
+            for box in boxes:
+                image = cv2.rectangle(
+                    image, 
+                    (max(box[0],0), max(box[1],0)), 
+                    (min(box[2], width-1), min(box[3], height-1)), 
+                    (255, 0, 0), 2)
+            cv2.imwrite("/home/detectron2_user/results/example.jpg", image)
+            
             losses = sum(loss_dict.values())
             assert torch.isfinite(losses).all(), loss_dict
 
@@ -162,7 +219,8 @@ def do_train(cfg, model, resume=False):
                 result_segm = result["segm"]
                 storage.put_scalars(**{"segm."+k:v for k,v in result_segm.items()})
                 storage.put_scalars(**{"bbox."+k:v for k,v in result_bbox.items()})
-                storage.put_scalar("mean_inference_time", result["mean_inference_time"])
+                if "mean_inference_time" in result:
+                    storage.put_scalar("mean_inference_time", result["mean_inference_time"])
                 comm.synchronize()
 
             if iteration - start_iter > 5 and (

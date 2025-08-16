@@ -1,0 +1,35 @@
+# Import base Nvidia image with ubuntu 22.04
+FROM nvidia/cuda:11.7.1-cudnn8-devel-ubuntu22.04
+
+# Set build argumetns
+
+# Set enviroment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DISPLAY=host.docker.internal:0.0
+
+# Update the image
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends apt-utils
+
+# Get python 3.10
+RUN apt-get install -y python3-pip
+
+# Install needed apt packages
+RUN apt-get install -y apt-transport-https \
+    curl \
+    gedit \
+    git \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    locales \
+    openssh-client \
+    software-properties-common
+
+ARG USER_ID=1000
+RUN useradd -m --no-log-init --system  --uid ${USER_ID} tensorboard_user -g sudo
+RUN echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+USER tensorboard_user
+WORKDIR /home/tensorboard_user
+
+ENV PATH="/home/tensorboard_user/.local/bin:${PATH}"
+
+RUN pip3 install --user tensorboard

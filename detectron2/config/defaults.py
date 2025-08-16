@@ -28,6 +28,7 @@ _C.VERSION = 2
 _C.MODEL = CN()
 _C.MODEL.LOAD_PROPOSALS = False
 _C.MODEL.MASK_ON = False
+_C.MODEL.MASKIOU_ON = False
 _C.MODEL.KEYPOINT_ON = False
 _C.MODEL.DEVICE = "cuda"
 _C.MODEL.META_ARCHITECTURE = "GeneralizedRCNN"
@@ -74,6 +75,10 @@ _C.INPUT.CROP.TYPE = "relative_range"
 # Size of crop in range (0, 1] if CROP.TYPE is "relative" or "relative_range" and in number of
 # pixels if CROP.TYPE is "absolute"
 _C.INPUT.CROP.SIZE = [0.9, 0.9]
+# Data augmentation by overlaying objects randomly on the image before image-wide augmentation
+_C.INPUT.OVERLAY = CN({"ENABLED": False})
+_C.INPUT.OVERLAY.DATASET = ""
+_C.INPUT.OVERLAY.COUNT = 0
 
 
 # Whether the model needs RGB, YUV, HSV etc.
@@ -85,6 +90,20 @@ _C.INPUT.FORMAT = "BGR"
 # The ground truth mask format that the model will use.
 # Mask R-CNN supports either "polygon" or "bitmask" as ground truth.
 _C.INPUT.MASK_FORMAT = "polygon"  # alternative: "bitmask"
+
+# Background augmentations
+_C.INPUT.BACKGROUND = CN()
+# Set hue and saturation to a random value through the image.
+# [min, max) in a range of values [0, 255]
+_C.INPUT.BACKGROUND.HUE_SET = None
+_C.INPUT.BACKGROUND.SAT_SET = None
+# Add a random value to hue and saturation through the image.
+# [min, max) in a range of values [-127, 128]
+_C.INPUT.BACKGROUND.HUE_SHIFT = None
+_C.INPUT.BACKGROUND.SAT_SHIFT = None
+# Probability of the above bg augmentations.
+_C.INPUT.BACKGROUND.HUE_PROB = 0.
+_C.INPUT.BACKGROUND.SAT_PROB = 0.
 
 
 # -----------------------------------------------------------------------------
@@ -137,6 +156,12 @@ _C.MODEL.BACKBONE.NAME = "build_resnet_backbone"
 # There are 5 stages in ResNet. The first is a convolution, and the following
 # stages are each group of residual blocks.
 _C.MODEL.BACKBONE.FREEZE_AT = 2
+
+# ---------------------------------------------------------------------------- #
+# Class name options
+# ---------------------------------------------------------------------------- #
+# Should be a list of strings, but None indicates unspecified
+_C.MODEL.CLASSES = None
 
 
 # ---------------------------------------------------------------------------- #
@@ -360,6 +385,23 @@ _C.MODEL.ROI_MASK_HEAD.CLS_AGNOSTIC_MASK = False
 # Type of pooling operation applied to the incoming feature map for each RoI
 _C.MODEL.ROI_MASK_HEAD.POOLER_TYPE = "ROIAlignV2"
 
+# Following only matter if MODEL.ROI_MASK_HEAD.NAME is "BoundaryPreservingHead"
+_C.MODEL.BOUNDARY_MASK_HEAD = CN()
+_C.MODEL.BOUNDARY_MASK_HEAD.POOLER_RESOLUTION = 28
+_C.MODEL.BOUNDARY_MASK_HEAD.IN_FEATURES = ["p2"]
+_C.MODEL.BOUNDARY_MASK_HEAD.NUM_CONV = 2
+
+_C.MODEL.BOUNDARY_MASK_HEAD.ATTENTION_DIM = None
+
+
+# ---------------------------------------------------------------------------- #
+# MaskIoU Scoring Head
+# ---------------------------------------------------------------------------- #
+_C.MODEL.ROI_MASKIOU_HEAD = CN()
+_C.MODEL.ROI_MASKIOU_HEAD.NAME = "BaseMaskIoUHead"
+_C.MODEL.ROI_MASKIOU_HEAD.LOSS_WEIGHT = 1.0
+_C.MODEL.ROI_MASKIOU_HEAD.LOSS_TYPE = "Smooth L1"
+
 
 # ---------------------------------------------------------------------------- #
 # Keypoint Head
@@ -395,6 +437,38 @@ _C.MODEL.ROI_KEYPOINT_HEAD.NORMALIZE_LOSS_BY_VISIBLE_KEYPOINTS = True
 _C.MODEL.ROI_KEYPOINT_HEAD.LOSS_WEIGHT = 1.0
 # Type of pooling operation applied to the incoming feature map for each RoI
 _C.MODEL.ROI_KEYPOINT_HEAD.POOLER_TYPE = "ROIAlignV2"
+
+# ---------------------------------------------------------------------------- #
+# PointRend Head
+# ---------------------------------------------------------------------------- #
+_C.MODEL.POINT_HEAD = CN()
+_C.MODEL.POINT_HEAD_ON = False
+_C.MODEL.POINT_HEAD.NAME = "StandardPointHead"
+_C.MODEL.POINT_HEAD.NUM_CLASSES = 80
+# Names of the input feature maps to be used by a mask point head.
+_C.MODEL.POINT_HEAD.IN_FEATURES = ("p2",)
+# Number of points sampled during training for a mask point head.
+_C.MODEL.POINT_HEAD.TRAIN_NUM_POINTS = 14 * 14
+# Oversampling parameter for PointRend point sampling during training. Parameter `k` in the
+# original paper.
+_C.MODEL.POINT_HEAD.OVERSAMPLE_RATIO = 3
+# Importance sampling parameter for PointRend point sampling during training. Parametr `beta` in
+# the original paper.
+_C.MODEL.POINT_HEAD.IMPORTANCE_SAMPLE_RATIO = 0.75
+# Number of subdivision steps during inference.
+_C.MODEL.POINT_HEAD.SUBDIVISION_STEPS = 5
+# Maximum number of points selected at each subdivision step (N).
+_C.MODEL.POINT_HEAD.SUBDIVISION_NUM_POINTS = 28 * 28
+_C.MODEL.POINT_HEAD.FC_DIM = 256
+_C.MODEL.POINT_HEAD.NUM_FC = 3
+_C.MODEL.POINT_HEAD.CLS_AGNOSTIC_MASK = False
+# The side size of a coarse mask head prediction.
+_C.MODEL.ROI_MASK_HEAD.OUTPUT_SIDE_RESOLUTION = 14
+_C.MODEL.ROI_MASK_HEAD.FC_DIM = 1024
+_C.MODEL.ROI_MASK_HEAD.NUM_FC = 2
+# If True, then coarse prediction features are used as inout for each layer in PointRend's MLP.
+_C.MODEL.POINT_HEAD.COARSE_PRED_EACH_LAYER = True
+_C.MODEL.POINT_HEAD.COARSE_SEM_SEG_HEAD_NAME = "SemSegFPNHead"
 
 # ---------------------------------------------------------------------------- #
 # Semantic Segmentation Head

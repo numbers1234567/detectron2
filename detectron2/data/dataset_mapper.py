@@ -2,10 +2,15 @@
 import copy
 import logging
 import numpy as np
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Tuple,Dict
 import torch
 
 from detectron2.config import configurable
+from detectron2.structures import BoxMode
+from itertools import product
+import random
+from pycocotools import mask
+import cv2
 
 from . import detection_utils as utils
 from . import transforms as T
@@ -15,6 +20,96 @@ This file contains the default mapping that's applied to "dataset dicts".
 """
 
 __all__ = ["DatasetMapper"]
+
+class BGAug:
+    """
+    A callable to apply augmentations to only the background.
+    Only does hue and saturation changes.
+    """
+    @configurable
+    def __init__(
+        self,
+        *,
+        hue_set : Optional[Tuple[int,int]]=None,
+        sat_set : Optional[Tuple[int,int]]=None,
+        hue_shift : Optional[Tuple[int,int]]=None,
+        sat_shift : Optional[Tuple[int,int]]=None,
+        hue_prob : Optional[float]=0,
+        sat_prob : Optional[float]=0,
+    ):
+        """
+        Args:
+            hue_set : Set the hue to a random, image-wide value in the given range
+            sat_set : Set the saturation to a random, image-wide value in the given range
+            hue_shift : Shift the hue by a random, image-wide value in the given range
+            sat_shift : Shift the saturation by a random, image-wide value in the given range
+            hue_prob : Probability of applying the above hue change
+            sat_prob : Probability of applying the above saturation change
+        Note: Only one type of augmentation can be applied to each of hue and saturation
+        """
+        assert hue_set is None or hue_shift is None
+        assert sat_set is None or sat_shift is None
+
+        self.hue_set = hue_set
+        self.sat_set = sat_set
+        self.hue_shift = hue_shift
+        self.sat_shift = sat_shift
+        self.hue_prob = hue_prob
+        self.sat_prob = sat_prob
+
+    @classmethod
+    def from_config(cls, cfg, is_train: bool = True):
+        ret = {
+            "hue_set"   : cfg.INPUT.BACKGROUND.HUE_SET,
+            "sat_set"   : cfg.INPUT.BACKGROUND.SAT_SET,
+            "hue_shift" : cfg.INPUT.BACKGROUND.HUE_SHIFT,
+            "sat_shift" : cfg.INPUT.BACKGROUND.SAT_SHIFT,
+            "hue_prob"  : cfg.INPUT.BACKGROUND.HUE_PROB,
+            "sat_prob"  : cfg.INPUT.BACKGROUND.SAT_PROB,
+        }
+
+        return ret
+
+    def __call__(self, image: np.ndarray, annotations: List[Dict]):
+        fg_mask = np.zeros_like(image)
+        for instance in annotations:
+            polygons = instance["segmentation"]
+            rles = mask.frPyObjects(
+                polygons, 
+                image.shape[0], 
+                image.shape[1],
+            )
+            bimask = mask.decode(rles)
+
+            if bimask.shape[2] > 1:  # Possible if multiple polygons
+                result = bimask[:,:,0]
+                for i in range(1,bimask.shape[2]):
+                    # xor allows us to represent holes in objects
+                    result = result ^ bimask[:,:,i]
+                bimask = np.expand_dims(result, 2)
+            fg_mask |= bimask
+        
+        bg_mask = 1-fg_mask
+
+        bg_aug = cv2.cvtColor(image, cv2.COLOR_BGR2HSV_FULL)
+        bg_aug = bg_aug.astype(np.uint32)
+        
+        if self.hue_set is not None and random.random() < self.hue_prob:
+            bg_aug[:,:,0] = np.random.randint(self.hue_set[0], self.hue_set[1], (1,))[0]
+        if self.sat_set is not None and random.random() < self.sat_prob:
+            bg_aug[:,:,1] = np.random.randint(self.sat_set[0], self.sat_set[1], (1,))[0]
+        if self.hue_shift is not None and random.random() < self.hue_prob:
+            bg_aug[:,:,0] += np.random.randint(self.hue_shift[0], self.hue_shift[1], (1,))[0]
+            bg_aug[:,:,0] %= 256  # Cylindrical
+        if self.sat_shift is not None and random.random() < self.hue_prob:
+            bg_aug[:,:,1] += np.random.randint(self.sat_shift[0], self.sat_shift[1], (1,))[0]
+            bg_aug[:,:,1] = np.clip(bg_aug[:,:,1], 0, 255)
+        
+        bg_aug = bg_aug.astype(np.uint8)
+        bg_aug = cv2.cvtColor(bg_aug, cv2.COLOR_HSV2BGR_FULL)
+
+        image = bg_mask*bg_aug + fg_mask*image
+        return image
 
 
 class DatasetMapper:
@@ -47,6 +142,9 @@ class DatasetMapper:
         keypoint_hflip_indices: Optional[np.ndarray] = None,
         precomputed_proposal_topk: Optional[int] = None,
         recompute_boxes: bool = False,
+        rand_obj_dataset_name: str="",
+        rand_objs_per_im: int|Tuple[int,int]=0,
+        bg_aug: BGAug=BGAug(),
     ):
         """
         NOTE: this interface is experimental.
@@ -77,10 +175,26 @@ class DatasetMapper:
         self.keypoint_hflip_indices = keypoint_hflip_indices
         self.proposal_topk          = precomputed_proposal_topk
         self.recompute_boxes        = recompute_boxes
+        self.bg_aug                 = bg_aug
         # fmt: on
         logger = logging.getLogger(__name__)
         mode = "training" if is_train else "inference"
         logger.info(f"[DatasetMapper] Augmentations used in {mode}: {augmentations}")
+        
+        self.overlay_enabled = rand_objs_per_im > 0
+        if self.overlay_enabled:
+            from detectron2.data import DatasetCatalog
+            self.rand_obj_annotations: list[dict] = DatasetCatalog.get(rand_obj_dataset_name)
+            self.rand_objs_per_image: int|tuple[int,int] = rand_objs_per_im
+            # In the future can have more options from configs
+            self.rand_obj_aug = T.AugmentationList([
+                T.RandomBrightness(0.9, 1.1),
+                T.RandomContrast(0.9, 1.1),
+                T.RandomSaturation(0.9, 1.1),
+                T.RandomFlip(prob=0.5),
+                T.RandomRotation([0, 359]),
+                T.RandomResize(list(product(range(10, 50), range(10, 50))))
+            ])
 
     @classmethod
     def from_config(cls, cfg, is_train: bool = True):
@@ -91,6 +205,7 @@ class DatasetMapper:
         else:
             recompute_boxes = False
 
+
         ret = {
             "is_train": is_train,
             "augmentations": augs,
@@ -99,7 +214,12 @@ class DatasetMapper:
             "instance_mask_format": cfg.INPUT.MASK_FORMAT,
             "use_keypoint": cfg.MODEL.KEYPOINT_ON,
             "recompute_boxes": recompute_boxes,
+            "bg_aug" : BGAug(**BGAug.from_config(cfg, is_train))
         }
+        
+        if cfg.INPUT.OVERLAY.ENABLED:
+            ret["rand_obj_dataset_name"] = cfg.INPUT.OVERLAY.DATASET
+            ret["rand_objs_per_im"] = cfg.INPUT.OVERLAY.COUNT
 
         if cfg.MODEL.KEYPOINT_ON:
             ret["keypoint_hflip_indices"] = utils.create_keypoint_hflip_indices(cfg.DATASETS.TRAIN)
@@ -141,6 +261,70 @@ class DatasetMapper:
             instances.gt_boxes = instances.gt_masks.get_bounding_boxes()
         dataset_dict["instances"] = utils.filter_empty_instances(instances)
 
+    def overlay_instance(self, dataset_dict, obj_image_file_name, obj_annotation):
+        polygons = obj_annotation["segmentation"]
+        # Transform obj and polygons jointly
+        crop = T.CropTransform(*[int(i) for i in obj_annotation["bbox"]])  # Expected xywh form already
+        obj_image_rgb = crop.apply_image(utils.read_image(obj_image_file_name, format=self.image_format))
+        polygons = crop.apply_polygons(
+            [np.reshape(p, (len(p)//2,2)) for p in polygons]
+        )
+
+        
+        obj_input = T.AugInput(obj_image_rgb)
+        transform = self.rand_obj_aug(obj_input)
+        polygons = transform.apply_polygons(polygons)
+        obj_image_rgb = obj_input.image
+
+        pad_before = [random.randint(0, image.shape[i] - obj_image_rgb.shape[i]) for i in range(2)]
+        for i in range(len(polygons)):
+            polygons[i][:,0] += pad_before[1]
+            polygons[i][:,1] += pad_before[0]
+
+        obj_image_rgb = np.pad(obj_image_rgb, 
+            ((pad_before[0], image.shape[0] - obj_image_rgb.shape[0]-pad_before[0]),
+            (pad_before[1], image.shape[1] - obj_image_rgb.shape[1]-pad_before[1]),
+            (0, 0)),
+            constant_values=0,)
+        
+        # Determine new bbox
+        x_min = min([p[:,0].min() for p in polygons])
+        x_max = max([p[:,0].max() for p in polygons])
+        y_min = min([p[:,1].min() for p in polygons])
+        y_max = max([p[:,1].max() for p in polygons])
+        polygons = [p.flatten() for p in polygons]  # Back to coco format
+
+        # Use transformed polygon to create a mask for overlaying onto the image
+        rles = mask.frPyObjects(
+            polygons, 
+            obj_image_rgb.shape[0], 
+            obj_image_rgb.shape[1],
+        )
+        bimask = mask.decode(rles)
+
+        # print("====", bimask.shape, image.shape, obj_image_rgb.shape)
+        if bimask.shape[2] > 1:  # Possible if multiple polygons
+            result = bimask[:,:,0]
+            for i in range(1,bimask.shape[2]):
+                # xor allows us to represent holes in objects
+                result = result ^ bimask[:,:,i]
+            bimask = np.expand_dims(result, 2)
+        # print("====", bimask.sum())
+        image.flags.writeable = True
+        bimask = np.concatenate((bimask, bimask, bimask), axis=2)
+        image = image*(1-bimask) + bimask*obj_image_rgb
+        image.flags.writeable = False
+
+        annotation_dict = {
+            'iscrowd' : 0,
+            'bbox' : [x_min, y_min, x_max-x_min, y_max-y_min],
+            'segmentation' : polygons,
+            'bbox_mode' : BoxMode.XYWH_ABS,
+            'category_id' : 1,
+        }
+        dataset_dict["annotations"].append(annotation_dict)
+        return image
+
     def __call__(self, dataset_dict):
         """
         Args:
@@ -160,9 +344,33 @@ class DatasetMapper:
         else:
             sem_seg_gt = None
 
+        if self.overlay_enabled and self.is_train:
+            if type(self.rand_objs_per_image)==int:
+                num_objs = self.rand_objs_per_image
+            else:
+                num_objs = random.randint(*self.rand_objs_per_image)
+            image = image.copy()
+            for _ in range(num_objs):
+                obj_image = random.choice(self.rand_obj_annotations)
+                while len(obj_image["annotations"])==0: 
+                    obj_image = random.choice(self.rand_obj_annotations)
+
+                obj_annotation = random.choice(obj_image["annotations"])
+                obj_image_filename = obj_image["file_name"]
+
+                image = self.overlay_instance(
+                    dataset_dict, 
+                    obj_image_filename, 
+                    obj_annotation
+                )
+
+
+        if self.is_train: image = self.bg_aug(image, dataset_dict["annotations"])
+        
         aug_input = T.AugInput(image, sem_seg=sem_seg_gt)
         transforms = self.augmentations(aug_input)
         image, sem_seg_gt = aug_input.image, aug_input.sem_seg
+        
 
         image_shape = image.shape[:2]  # h, w
         # Pytorch's dataloader is efficient on torch.Tensor due to shared-memory,

@@ -1,11 +1,14 @@
-version: "2.3"
 services:
   detectron2:
+    container_name: docker-detectron2
+    image: "docker-detectron2:v1"
+    restart: unless-stopped
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        USER_ID: ${USER_ID:-1000}
+        ACCESS_KEY: ${GITTOKEN}
+        GIT_BRANCH: dev
     deploy:
       resources:
         reservations:
@@ -17,10 +20,32 @@ services:
       memlock: -1
       stack: 67108864
     volumes:
-      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - ./results:/home/detectron2_user/results
+      - ./datasets:/home/detectron2_user/datasets
+      # detectron2 repo has a configs directory, but this allows user-defined configs
+      - ./configs:/home/detectron2_user/configs
+      - ./augmentation_train_net.py:/home/detectron2_user/detectron2/augmentation_train_net.py
+      - ${HOME}/detectron2_extra_pretrained:/home/detectron2_user/extra_pretrained
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ${HOME}/.Xauthority:/home/detectron2_user/.Xauthority:ro
     environment:
       - DISPLAY=$DISPLAY
       - NVIDIA_VISIBLE_DEVICES=all
-    # Uncomment with proper source to access webcam from docker
-    # devices: 
-    #   - /dev/video0:/dev/video0
+      - DETECTRON2_DATASETS=/home/detectron2_user/datasets
+    # In the following, can set number of GPUs and number of machines
+    # Training
+    command: ["python3", "augmentation_train_net.py", "--resume", "--config-file", "/home/detectron2_user/configs/config.yaml", "OUTPUT_DIR", "/home/detectron2_user/results"]
+  tensorboard:
+    container_name: docker-tensorboard
+    image: "docker-detectron2:v1"
+    build:
+      context: .
+      args:
+        ACCESS_KEY: ${GITTOKEN}
+        GIT_BRANCH: dev
+      dockerfile: Dockerfile-tensorboard
+    volumes:
+      - ./results:/home/detectron2_user/detectron2/results
+    ports:
+      - 6006:6006
+    command: ["tensorboard", "--logdir", "/home/detectron2_user/detectron2/results", "--bind_all"]

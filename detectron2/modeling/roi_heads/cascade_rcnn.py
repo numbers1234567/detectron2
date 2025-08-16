@@ -14,7 +14,7 @@ from ..matcher import Matcher
 from ..poolers import ROIPooler
 from .box_head import build_box_head
 from .fast_rcnn import FastRCNNOutputLayers, fast_rcnn_inference
-from .roi_heads import ROI_HEADS_REGISTRY, StandardROIHeads
+from .roi_heads import ROI_HEADS_REGISTRY, StandardROIHeads, BoundaryROIHeads
 
 
 class _ScaleGradient(Function):
@@ -144,6 +144,8 @@ class CascadeROIHeads(StandardROIHeads):
             losses = self._forward_box(features, proposals, targets)
             losses.update(self._forward_mask(features, proposals))
             losses.update(self._forward_keypoint(features, proposals))
+            losses.update(self._forward_maskiou(features, proposals))
+            losses.update(self._forward_point_head(features, proposals))
             return proposals, losses
         else:
             pred_instances = self._forward_box(features, proposals)
@@ -297,3 +299,12 @@ class CascadeROIHeads(StandardROIHeads):
             prop.proposal_boxes = boxes_per_image
             proposals.append(prop)
         return proposals
+
+@ROI_HEADS_REGISTRY.register()
+class BoundaryCascadeROIHeads(CascadeROIHeads, BoundaryROIHeads):
+    @configurable
+    def __init__(
+        self, 
+        **kwargs
+    ):
+        super().__init__(**kwargs)

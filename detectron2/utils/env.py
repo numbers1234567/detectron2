@@ -9,6 +9,29 @@ import sys
 from datetime import datetime
 import torch
 
+def setup_datasets():
+    # Prevent circular import
+    from detectron2.data.datasets import register_coco_instances
+    import os
+
+    datasets_dir = os.getenv("DETECTRON2_DATASETS", "datasets")
+
+    # Register user-supplied datasets
+    for dataset in os.listdir(datasets_dir):
+        dataset_dir = os.path.join(datasets_dir, dataset)
+        if not os.path.isdir(dataset_dir): continue
+        if not os.path.isdir(os.path.join(dataset_dir, "images")): continue
+        if not os.path.isdir(os.path.join(dataset_dir, "splits")): continue
+        for split in os.listdir(os.path.join(dataset_dir, "splits")):
+            if split.split(".")[-1].lower()!="json": continue
+            # Create new dataset using this split
+            register_coco_instances(
+                f"{dataset}_{split.split('.')[0]}", 
+                {}, 
+                os.path.join(dataset_dir, "splits", split),
+                os.path.join(dataset_dir, "images"),
+            )
+
 __all__ = ["seed_all_rng"]
 
 
@@ -113,8 +136,7 @@ def setup_environment():
     if custom_module_path:
         setup_custom_environment(custom_module_path)
     else:
-        # The default setup is a no-op
-        pass
+        setup_datasets()
 
 
 def setup_custom_environment(custom_module):

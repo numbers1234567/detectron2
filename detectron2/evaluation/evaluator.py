@@ -127,6 +127,7 @@ def inference_on_dataset(
 
     Returns:
         The return value of `evaluator.evaluate()`
+        The returned dict additionally includes the mean inference time per sample
     """
     num_devices = get_world_size()
     logger = logging.getLogger(__name__)
@@ -217,6 +218,8 @@ def inference_on_dataset(
     # Replace it by an empty dict instead to make it easier for downstream code to handle
     if results is None:
         results = {}
+
+    results["mean_inference_time"] = total_compute_time / (total - num_warmup)
     return results
 
 
